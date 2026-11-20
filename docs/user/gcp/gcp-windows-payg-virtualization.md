@@ -2,16 +2,13 @@
 
 This proposed **SRE-assisted** procedure runs Windows Server 2025 virtual
 machines (VMs) on dedicated OpenShift Virtualization workers using Google
-Cloud pay-as-you-go (PAYG) licensing. Instead of stopping and licensing
-existing workers, it creates a licensed copy of a RHCOS boot image and
-provisions **new, dedicated C3-metal MachineSets** from that image. VM
-placement uses a Node label and a matching
-`NoSchedule` toleration, not a hostname. Windows guest-image creation is not
-covered: use an existing, compatible Windows Server 2025 Datacenter boot
-source.
+Cloud pay-as-you-go (PAYG) licensing. It creates a licensed copy of a RHCOS
+boot image and provisions **dedicated C3-metal MachineSets** from that image.
+VMs select these workers by Node label and tolerate their `NoSchedule` taint.
+Use an existing, compatible Windows Server 2025 Datacenter boot source.
 
 > **Support and licensing assumptions:** This procedure assumes that Google
-> Cloud accepts a copy of the current RHCOS image carrying both its original
+> Cloud accepts a copy of the current RHCOS image carrying both its existing
 > marketplace license and `windows-server-2025-dc`, and that Red Hat agrees
 > to provision and maintain dedicated MachineSets and the required
 > `MachineConfiguration/cluster` policy. Verify those assumptions with Red Hat
@@ -53,16 +50,11 @@ source.
 - Available C3-metal quota/capacity. PAYG licensing is associated with the
   worker boot disk and has billing implications even when no guest is running.
 
-The installer generates GCP MachineSets from its Go code in
-`pkg/asset/machines/gcp/machinesets.go` and
-`pkg/asset/machines/gcp/machines.go`; there is no separate C3-metal YAML
-template to fill in. This guide instead uses the **actual worker MachineSet
-in each zone** as the template. Run steps 1, 2, and 4 once for **each existing
-ordinary worker MachineSet**, creating one new dedicated MachineSet alongside
-each source. Steps 3, 5, and 7 are cluster-wide or per-guest checks as
-indicated. **The MachineSet commands are instructions for an approved SRE
-operator, not for an OSD customer account.** No existing MachineSet is scaled
-down and no existing worker is replaced as part of initial setup.
+Use the **current worker MachineSet in each zone** as a read-only template.
+Run steps 1, 2, and 4 once for **each ordinary worker MachineSet**, creating
+one dedicated MachineSet alongside each source. Steps 3, 5, and 7 are
+cluster-wide or per-guest checks as indicated. **The MachineSet commands are
+instructions for an approved SRE operator, not for an OSD customer account.**
 Run commands from a shell with the intended `oc` cluster context and `gcloud`
 credentials.
 
@@ -181,7 +173,7 @@ gcloud compute images describe "$LICENSED_IMAGE" \
   --format='yaml(name,licenses,status)'
 ```
 
-**Stop here** if the copy fails, the original marketplace license is missing,
+**Stop here** if the copy fails, the source marketplace license is missing,
 or the Windows license is missing. Image licenses still need to be verified on
 an actual *new worker boot disk* after provisioning.
 
@@ -367,9 +359,9 @@ If it is `False`, arrange for Private Google Access to be enabled through the
 cluster's approved networking process. Test connectivity **inside a Windows
 guest** in the next step. A successful TCP connection does not prove that
 activation succeeded or that the KMS request is attributed to the licensed
-worker. Do not add a `/32` route as an unconditional step; troubleshoot the
-actual NAT, egress, firewall, and KMS path with the network owners if activation
-fails.
+worker. If activation fails, work with the network owners to check NAT,
+routing, firewall rules, and whether KMS sees traffic from the licensed
+worker.
 
 ## 6. Create and place a Windows VM
 
@@ -380,8 +372,8 @@ one in another namespace requires the usual CDI clone permissions. Choose the
 Hyperdisk StorageClass for its root disk.
 
 Before starting the VM, ensure its `spec.template.spec` has a Node selector
-for the licensed workers and uses the pod network with masquerade, as in the
-[original tested activation walkthrough](https://cloud.redhat.com/experts/osd/gcp-windows-payg-activation/):
+and toleration for the licensed workers and uses the pod network with
+masquerade:
 
 ```yaml
 spec:
@@ -461,7 +453,7 @@ repeat the following for its **corresponding** dedicated MachineSet:
    new `IMAGE_REV` and `LICENSED_IMAGE` for this version; record its
    associated OpenShift release/RHCOS version.
 2. Create a **new, versioned** copy using step 2, carrying forward the
-   original marketplace license and adding the Windows PAYG license.
+   source marketplace license and adding the Windows PAYG license.
    Verify both licenses on the new image.
 3. Update the boot disk `image` reference on the corresponding dedicated
    MachineSet.
@@ -492,9 +484,9 @@ manually maintained boot images remain.
 
 ## References
 
-- [Original OSD GCP Windows PAYG walkthrough](https://cloud.redhat.com/experts/osd/gcp-windows-payg-activation/)
 - [Google Cloud: manage licenses](https://docs.cloud.google.com/compute/docs/licenses/manage)
 - [Google Cloud: license changes and restrictions](https://docs.cloud.google.com/compute/docs/licenses/license-changes-and-restrictions)
 - [OpenShift: boot-image management](https://docs.redhat.com/en/documentation/openshift_container_platform/4.21/html/machine_configuration/mco-update-boot-images)
 - [OpenShift: `MachineConfiguration` API](https://docs.redhat.com/en/documentation/openshift_container_platform/4.21/html/operator_apis/machineconfiguration-operator-openshift-io-v1)
 - [OSD admission webhook: customer restrictions on `machine.openshift.io`](https://github.com/openshift/managed-cluster-validating-webhooks/blob/master/pkg/webhooks/regularuser/common/regularuser.go)
+- [OSD GCP Windows PAYG reference](https://cloud.redhat.com/experts/osd/gcp-windows-payg-activation/)
