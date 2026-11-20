@@ -31,8 +31,8 @@ taint. Use an existing, compatible Windows Server 2025 Datacenter boot source.
   MachineSet or worker is required.
 - A Windows Server 2025 Datacenter VM boot source available as a CDI
   DataSource in the guest's namespace. Preparing that source is a separate,
-  generic OpenShift Virtualization task. The Hyperdisk StorageClass is
-  checked and, if necessary, created below.
+  generic OpenShift Virtualization task. The dedicated Hyperdisk StorageClass
+  is created below.
 - Available C3-metal quota/capacity. PAYG licensing is associated with the
   worker boot disk and has billing implications even when no guest is running.
 
@@ -90,7 +90,7 @@ The new MachineSet keeps the source's
 If the cluster uses a different naming convention, choose a unique `NEW_MS`
 manually rather than relying on the substitution above.
 
-## Check guest storage
+## Create a dedicated guest StorageClass
 
 The worker's Hyperdisk **boot disk** (configured in step 4) and the Windows
 guest's **PVC** are separate. The guest needs a StorageClass backed by the
@@ -102,37 +102,12 @@ oc get csidriver pd.csi.storage.gke.io
 ```
 
 If the driver is missing, resolve that first; a StorageClass cannot install a
-CSI driver. Choose an existing suitable class if available. The following
-looks for one with deferred binding so a new disk can be placed in the VM's
-zone, without restricting it to a single zone or storage pool:
+CSI driver. Create a **non-default** class for Windows VM disks. Deferred
+binding lets the CSI driver provision the disk in the selected VM's zone:
 
 ```bash
-HYPERDISK_SC=$(
-  oc get storageclass -o json |
-    jq -r '.items[]
-           | select(.provisioner == "pd.csi.storage.gke.io"
-                    and .parameters.type == "hyperdisk-balanced"
-                    and .volumeBindingMode == "WaitForFirstConsumer"
-                    and .allowVolumeExpansion == true
-                    and .allowedTopologies == null
-                    and (.parameters["storage-pools"] // "") == "")
-           | .metadata.name' |
-    head -n 1
-)
-echo "Suitable existing StorageClass: ${HYPERDISK_SC:-none}"
-```
-
-If none is found, create a **non-default** class. Do not change the cluster's
-default StorageClass, which might serve workers with different disk
-requirements:
-
-```bash
-if [[ -z "$HYPERDISK_SC" ]]; then
-  HYPERDISK_SC=windows-payg-hyperdisk
-  if oc get storageclass "$HYPERDISK_SC" >/dev/null 2>&1; then
-    echo "StorageClass $HYPERDISK_SC already exists but does not match; inspect it or choose another name" >&2
-    exit 1
-  fi
+export HYPERDISK_SC=windows-payg-hyperdisk
+if ! oc get storageclass "$HYPERDISK_SC" >/dev/null 2>&1; then
   cat <<'EOF' | oc create -f -
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -147,11 +122,24 @@ allowVolumeExpansion: true
 reclaimPolicy: Delete
 EOF
 fi
-export HYPERDISK_SC
-oc get storageclass "$HYPERDISK_SC" -o yaml
+oc get storageclass "$HYPERDISK_SC" -o json |
+  jq -e '.provisioner == "pd.csi.storage.gke.io"
+         and .parameters.type == "hyperdisk-balanced"
+         and .parameters["replication-type"] == "none"
+         and .volumeBindingMode == "WaitForFirstConsumer"
+         and .allowVolumeExpansion == true
+         and .reclaimPolicy == "Delete"
+         and (.metadata.annotations["storageclass.kubernetes.io/is-default-class"] // "false") != "true"' \
+    >/dev/null ||
+  { echo "StorageClass $HYPERDISK_SC exists but does not match this procedure" >&2; exit 1; }
+oc get storageclass "$HYPERDISK_SC"
 ```
 
-Use `$HYPERDISK_SC` explicitly for the Windows VM's root disk in step 6.
+Use `$HYPERDISK_SC` explicitly for the Windows VM's root disk in step 6; this
+StorageClass does not restrict other workloads from requesting it. The VM's
+node selector and toleration control placement on the dedicated workers.
+The class is **not** the worker's boot disk and does not change the cluster's
+default StorageClass.
 Hyperdisk Balanced volumes must be at least **4 GiB**; the Windows disk must
 also be large enough for its boot source. A matching StorageClass does not
 prove that storage can be provisioned on every selected worker. Check the
