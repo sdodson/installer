@@ -38,8 +38,9 @@ taint. Use an existing, compatible Windows Server 2025 Datacenter boot source.
 
 Use the **current worker MachineSet in each zone** as a read-only template.
 Run steps 1, 2, and 4 once for **each ordinary worker MachineSet**, creating
-one dedicated MachineSet alongside each source. Steps 3, 5, and 7 are
-cluster-wide or per-guest checks as indicated.
+one dedicated MachineSet alongside each source. If enabling autoscaling,
+repeat the MachineAutoscaler portion of step 8 for each dedicated MachineSet.
+The `ClusterAutoscaler` in step 8 is cluster-wide.
 Run commands from a shell with the intended `oc` cluster context and `gcloud`
 credentials.
 
@@ -423,6 +424,9 @@ masquerade:
 ```yaml
 spec:
   template:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
     spec:
       nodeSelector:
         workload.example.com/windows-payg: "true"
@@ -448,10 +452,12 @@ memory. The selector keeps the VM on these workers; the toleration permits it
 past their taint. Toleration alone does **not** restrict a workload to these
 workers, and any other workload granted this toleration could also run there.
 Use admission/RBAC controls if scheduling must be strictly limited to
-authorized Windows workloads. For the
-single-node `ReadWriteOnce` example, `evictionStrategy: None` avoids assuming
-live migration is available. HA or live migration requires appropriately
-licensed destinations and migration-capable storage.
+authorized Windows workloads. The annotation prevents the cluster autoscaler
+from evicting a running VM's `virt-launcher` pod during scale-down; verify
+that it appears on the pod before enabling autoscaling. For the single-node
+`ReadWriteOnce` example, `evictionStrategy: None` avoids assuming live
+migration is available. HA or live migration requires appropriately licensed
+destinations and migration-capable storage.
 
 Verify the VM is running on a labeled, license-verified worker:
 
@@ -488,7 +494,104 @@ cscript //nologo C:\Windows\System32\slmgr.vbs /dli
 The final check is **`License Status: Licensed`**, on a VM running on a
 verified PAYG worker. KMS renewal must remain possible while it runs.
 
-## 8. Maintain licensed boot images after cluster upgrades
+## 8. Enable autoscaling (optional)
+
+These MachineSets are compatible with the OpenShift cluster autoscaler: they
+use the Machine API, start with one worker, and retain the labels, taint, and
+licensed boot image when scaling out. Autoscaling responds to **unschedulable
+VM launcher pods**, not CPU usage inside a Windows guest. Ensure VMs request
+enough CPU and memory for the scheduler to recognize when additional workers
+are needed. Check C3-metal quota and capacity in each zone before raising
+replica limits.
+
+A cluster has at most one `ClusterAutoscaler` named `default`. Check for it:
+
+```bash
+oc get clusterautoscaler default -o yaml
+```
+
+If none exists, set a cluster-wide node limit **above the total number of
+control-plane nodes and the maximum for all ordinary and dedicated worker
+MachineSets**, then create it:
+
+```bash
+export MAX_NODES_TOTAL=20 # Replace with a limit sized for this cluster.
+cat <<EOF | oc create -f -
+apiVersion: autoscaling.openshift.io/v1
+kind: ClusterAutoscaler
+metadata:
+  name: default
+spec:
+  enforceNodeGroupMinSize: Enabled
+  resourceLimits:
+    maxNodesTotal: ${MAX_NODES_TOTAL}
+  scaleDown:
+    enabled: true
+    cordonNodeBeforeTerminating: Enabled
+EOF
+```
+
+If a `ClusterAutoscaler` already exists, **do not create another or replace
+its settings**. Verify that its `maxNodesTotal`, any cluster-wide CPU and
+memory maxima (a C3-metal worker has 192 vCPUs), and other limits can
+accommodate the proposed maximum. Set `enforceNodeGroupMinSize: Enabled` if
+you rely on keeping one licensed worker per MachineSet. Coordinate changes
+to the existing singleton with its owner.
+
+Before allowing automatic scale-down, verify that each running Windows VM's
+`virt-launcher` pod actually has
+`cluster-autoscaler.kubernetes.io/safe-to-evict: "false"`:
+
+```bash
+oc get pods -n <windows-vm-namespace> -o json |
+  jq -r '.items[]
+         | select(.metadata.name | startswith("virt-launcher-"))
+         | [.metadata.name,
+            .metadata.annotations["cluster-autoscaler.kubernetes.io/safe-to-evict"]]
+         | @tsv'
+```
+
+If the annotation is absent, resolve that before enabling scale-down. With
+`evictionStrategy: None` and a zonal `ReadWriteOnce` boot disk, evicting a
+running VM would interrupt it. This annotation protects against **autoscaler
+scale-down**, not host failures, cluster updates, or manual drains.
+
+Create a `MachineAutoscaler` **for each dedicated MachineSet**, after its
+initial worker's disk licenses and guest activation have been verified. Use
+the matching `$NEW_MS` from that MachineSet's creation step:
+
+```bash
+export MAX_REPLICAS=2 # Per zone; choose according to quota and license cost.
+cat <<EOF | oc apply -f -
+apiVersion: autoscaling.openshift.io/v1beta1
+kind: MachineAutoscaler
+metadata:
+  name: ${NEW_MS}
+  namespace: openshift-machine-api
+spec:
+  minReplicas: 1
+  maxReplicas: ${MAX_REPLICAS}
+  scaleTargetRef:
+    apiVersion: machine.openshift.io/v1beta1
+    kind: MachineSet
+    name: ${NEW_MS}
+EOF
+oc get machineautoscaler "$NEW_MS" -n openshift-machine-api
+oc get machineset "$NEW_MS" -n openshift-machine-api
+```
+
+The minimum keeps one verified worker in each zone; idle additional workers
+can scale down if they have no protected workloads. An unschedulable VM can
+trigger scale-up only if the new worker's labels, taints, zone, available
+storage, and capacity would allow its pod to schedule. Verify the PAYG
+license on **every** worker created by autoscaling. A pending VM might land
+on a new worker as soon as it is ready, so a manual check cannot serve as a
+pre-scheduling gate. Validate the licensed image and first worker before
+enabling autoscaling, then automate license checks and alerting (or enforce
+a scheduling gate) for new workers. The MachineSet label alone is not proof
+of licensing.
+
+## 9. Maintain licensed boot images after cluster upgrades
 
 The special MachineSets are **excluded from automatic boot-image updates**,
 not from in-place RHCOS updates on their running workers. A MachineSet's boot
@@ -523,7 +626,7 @@ Perform boot-image refresh and skew checks *before* subsequent upgrades. Do
 not delete an image while a MachineSet still needs it to provision new
 workers.
 
-## 9. Off-ramp
+## 10. Off-ramp
 
 Stop or relocate Windows VMs before reducing the dedicated MachineSet
 replicas. Verify that removed GCE workers' **licensed boot disks were
@@ -538,4 +641,5 @@ manually maintained boot images remain.
 - [Google Cloud: license changes and restrictions](https://docs.cloud.google.com/compute/docs/licenses/license-changes-and-restrictions)
 - [OpenShift: boot-image management](https://docs.redhat.com/en/documentation/openshift_container_platform/4.21/html/machine_configuration/mco-update-boot-images)
 - [OpenShift: `MachineConfiguration` API](https://docs.redhat.com/en/documentation/openshift_container_platform/4.21/html/operator_apis/machineconfiguration-operator-openshift-io-v1)
+- [OpenShift: cluster and machine autoscaling](https://docs.redhat.com/en/documentation/openshift_container_platform/4.21/html/machine_management/applying-autoscaling)
 - [Windows PAYG activation reference](https://cloud.redhat.com/experts/osd/gcp-windows-payg-activation/)
