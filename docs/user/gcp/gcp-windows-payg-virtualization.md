@@ -1,48 +1,34 @@
-# Windows Server PAYG on OpenShift Dedicated for Google Cloud
+# Windows Server PAYG on OpenShift Container Platform for Google Cloud
 
-This proposed **SRE-assisted** procedure runs Windows Server 2025 virtual
-machines (VMs) on dedicated OpenShift Virtualization workers using Google
-Cloud pay-as-you-go (PAYG) licensing. It creates a licensed copy of a RHCOS
-boot image and provisions **dedicated C3-metal MachineSets** from that image.
-VMs select these workers by Node label and tolerate their `NoSchedule` taint.
-Use an existing, compatible Windows Server 2025 Datacenter boot source.
+This procedure runs Windows Server 2025 virtual machines (VMs) on dedicated
+OpenShift Virtualization workers using Google Cloud pay-as-you-go (PAYG)
+licensing. It creates a licensed copy of a Red Hat Enterprise Linux CoreOS
+(RHCOS) boot image and provisions **dedicated C3-metal MachineSets** from that
+image. VMs select these workers by Node label and tolerate their `NoSchedule`
+taint. Use an existing, compatible Windows Server 2025 Datacenter boot source.
 
-> **Support and licensing assumptions:** This procedure assumes that Google
-> Cloud accepts a copy of the current RHCOS image carrying both its existing
-> marketplace license and `windows-server-2025-dc`, and that Red Hat agrees
-> to provision and maintain dedicated MachineSets and the required
-> `MachineConfiguration/cluster` policy. Verify those assumptions with Red Hat
-> and Google Cloud for the target cluster. A successful GCE image creation
-> alone does not establish that guest activation or the licensing arrangement
-> is supported.
-
-> **Not customer self-service on OSD:** The OpenShift Cluster Manager
-> MachinePool API does not expose a GCP boot-image field. OSD's
-> `regular-user-validation` admission webhook also denies customer writes to
-> the entire `machine.openshift.io` API group, including MachineSets, even
-> for CCS `cluster-admin` users. The `oc apply`, scaling, and MachineSet image
-> update steps below therefore require Red Hat SRE/backplane action or an
-> explicitly supported service-level mechanism. Customer `oc auth can-i`
-> checks alone do not establish that admission will allow a request. Do not
-> attempt to bypass admission with alternate identities. Without an approved
-> path for provisioning and maintaining these MachineSets, this workflow
-> cannot be completed on OSD.
+> **Licensing assumption:** This procedure assumes Google Cloud accepts a
+> copy of the current RHCOS image with its existing licenses (if any) plus
+> `windows-server-2025-dc`. Confirm the licensing arrangement with Google
+> Cloud and verify guest activation before running production workloads.
+> Successful image creation alone does not establish that licensing or
+> activation is supported.
 
 ## Prerequisites
 
-- An OpenShift Dedicated (OSD) CCS cluster on Google Cloud with Workload
-  Identity Federation and OpenShift Virtualization, with C3-metal capacity
-  available in the chosen zones. Check the minimum OSD and Virtualization
-  versions for Google Cloud Hyperdisk in the
-  [OSD Virtualization documentation](https://docs.redhat.com/en/documentation/openshift_dedicated/4/html/virtualization/installing).
-- Access to `oc`, `gcloud`, and `jq`, with permissions to inspect and create
-  GCE images. **Red Hat SRE** must approve and perform the MachineSet writes
-  and coordinate the cluster-wide `MachineConfiguration` policy changes.
+- An OpenShift Container Platform (OCP) cluster on Google Cloud with
+  OpenShift Virtualization installed and C3-metal capacity available in the
+  chosen zones. Check the [OCP Virtualization installation
+  requirements](https://docs.redhat.com/en/documentation/openshift_container_platform/4.21/html/virtualization/installing)
+  for your cluster version.
+- `oc`, `gcloud`, and `jq`; cluster-admin access to manage MachineSets and
+  `MachineConfiguration/cluster`; and GCP permissions to inspect and create
+  Compute Engine images.
 - Existing **ordinary** GCP worker MachineSets to use as read-only sources
   for the current RHCOS images and cluster-specific networks, credentials,
-  user data, service accounts, and zones. Obtain OSD-approved C3-metal
-  configuration requirements before creating the new MachineSets; no
-  pre-existing C3-metal MachineSet or worker is required.
+  user data, service accounts, and zones. Confirm the C3-metal configuration
+  requirements before creating the new MachineSets; no pre-existing C3-metal
+  MachineSet or worker is required.
 - A Hyperdisk-backed StorageClass suitable for the Windows guest and a
   Windows Server 2025 Datacenter VM boot source available as a CDI DataSource
   in the guest's namespace. Preparing that source is a separate, generic
@@ -53,8 +39,7 @@ Use an existing, compatible Windows Server 2025 Datacenter boot source.
 Use the **current worker MachineSet in each zone** as a read-only template.
 Run steps 1, 2, and 4 once for **each ordinary worker MachineSet**, creating
 one dedicated MachineSet alongside each source. Steps 3, 5, and 7 are
-cluster-wide or per-guest checks as indicated. **The MachineSet commands are
-instructions for an approved SRE operator, not for an OSD customer account.**
+cluster-wide or per-guest checks as indicated.
 Run commands from a shell with the intended `oc` cluster context and `gcloud`
 credentials.
 
@@ -63,7 +48,7 @@ oc whoami
 oc config current-context
 gcloud config get-value project
 
-export GCP_PROJECT="YOUR_CCS_PROJECT_ID"
+export GCP_PROJECT="YOUR_GCP_PROJECT_ID"
 export CLUSTER_ID="$(oc get infrastructure cluster -o jsonpath='{.status.infrastructureName}')"
 export IMAGE_REV="$(date +%Y%m%d)" # Change for each new image version.
 export MACHINE_TYPE=c3-standard-192-metal
@@ -149,8 +134,8 @@ updates.
 
 ## 2. Copy the RHCOS image with the PAYG license
 
-Include **all licenses on the source image**, as well as the Windows license.
-Do not replace the source image's existing marketplace license.
+Include **all licenses on the source image, if any**, as well as the Windows
+license. Preserve the source image's existing licenses.
 
 ```bash
 LICENSES=$(
@@ -173,7 +158,7 @@ gcloud compute images describe "$LICENSED_IMAGE" \
   --format='yaml(name,licenses,status)'
 ```
 
-**Stop here** if the copy fails, the source marketplace license is missing,
+**Stop here** if the copy fails, any existing source-image license is missing,
 or the Windows license is missing. Image licenses still need to be verified on
 an actual *new worker boot disk* after provisioning.
 
@@ -194,11 +179,11 @@ oc get machinesets -n openshift-machine-api --show-labels
 
 If `.status.bootImageSkewEnforcementStatus.mode` is `Automatic`, the API
 requires `All` MachineSets to be managed. Change skew enforcement to `Manual`
-**first**, before changing MachineSet selection to `Partial`. Coordinate
-this **cluster-wide** setting with OSD operations. The manual version must
-describe the **oldest boot image still used by any relevant MachineSet**,
-including the new licensed image; it is not necessarily the current cluster
-version. For example, edit `oc edit machineconfiguration cluster` to add:
+**first**, before changing MachineSet selection to `Partial`. This is a
+**cluster-wide** setting. The manual version must describe the **oldest boot
+image still used by any relevant MachineSet**, including the new licensed
+image; it is not necessarily the current cluster version. For example, edit
+`oc edit machineconfiguration cluster` to add:
 
 ```yaml
 spec:
@@ -256,7 +241,7 @@ unlabeled: they could otherwise be selected for an automatic image update.
 Use **this source worker MachineSet** as a read-only starting point for its
 **one new, separately named MachineSet in the same zone**. Its replicas and
 workers stay unchanged. Set the new MachineSet's type and boot disk to the
-OSD-approved C3-metal configuration. The two label locations serve different
+required C3-metal configuration. The two label locations serve different
 purposes:
 
 - `metadata.labels` labels the **MachineSet**, excluding it from MCO boot
@@ -306,10 +291,10 @@ maintenance policy, network, service account, user data, worker role,
 **both** label locations, and the `workload.example.com/windows-payg`
 `NoSchedule` taint. Check inherited taints too: the VM needs tolerations for
 any that remain. The example removes a source MachineSet's Secure Boot
-setting because Shielded VM Secure Boot is not supported for OSD GCP
-bare-metal workers; verify the resulting `shieldedInstanceConfig` against
-your cluster policy. Confirm any further C3-metal-specific requirements
-with OSD operations before applying it.
+setting because Shielded VM Secure Boot is not supported for GCP bare-metal
+workers; verify the resulting `shieldedInstanceConfig` against your cluster
+policy. Confirm any further C3-metal-specific requirements before applying
+the manifest.
 
 ```bash
 oc apply -f "$MS_FILE"
@@ -328,7 +313,7 @@ gcloud compute instances describe "$WORKER_INSTANCE" \
   --format='yaml(disks[].boot,disks[].licenses,disks[].autoDelete)'
 ```
 
-Expect the source RHCOS marketplace license **and**
+Expect **all licenses on the source image (if any)** and
 `windows-server-2025-dc`. Do not schedule licensed guests on an unverified
 new worker. Recheck licenses whenever this dedicated MachineSet subsequently
 provisions another worker.
@@ -337,8 +322,8 @@ Before deploying VMs, check that OpenShift Virtualization's node-specific
 components (in particular `virt-handler`) and the GCP storage CSI components
 needed on the workers can tolerate the taint and become healthy. For example,
 inspect `oc -n openshift-cnv get daemonset virt-handler -o yaml` and the
-relevant storage DaemonSets. Coordinate any necessary placement/toleration
-changes with OSD operations. Do **not** remove the taint just to make an
+relevant storage DaemonSets. Configure any necessary placement/toleration
+changes for these components. Do **not** remove the taint just to make an
 unprepared component schedule.
 
 ## 5. Check guest-to-KMS connectivity
@@ -452,8 +437,8 @@ repeat the following for its **corresponding** dedicated MachineSet:
 1. Read that MachineSet's **new** boot image reference as in step 1. Set a
    new `IMAGE_REV` and `LICENSED_IMAGE` for this version; record its
    associated OpenShift release/RHCOS version.
-2. Create a **new, versioned** copy using step 2, carrying forward the
-   source marketplace license and adding the Windows PAYG license.
+2. Create a **new, versioned** copy using step 2, carrying forward any
+   licenses on the source image and adding the Windows PAYG license.
    Verify both licenses on the new image.
 3. Update the boot disk `image` reference on the corresponding dedicated
    MachineSet.
@@ -469,9 +454,9 @@ repeat the following for its **corresponding** dedicated MachineSet:
    it to the newest ordinary worker image while licensed MachineSets still
    reference an older one.
 
-Coordinate boot-image refresh and skew checks with OSD operations *before*
-subsequent upgrades. Do not delete an image while a MachineSet still needs
-it to provision new workers.
+Perform boot-image refresh and skew checks *before* subsequent upgrades. Do
+not delete an image while a MachineSet still needs it to provision new
+workers.
 
 ## 9. Off-ramp
 
@@ -488,5 +473,4 @@ manually maintained boot images remain.
 - [Google Cloud: license changes and restrictions](https://docs.cloud.google.com/compute/docs/licenses/license-changes-and-restrictions)
 - [OpenShift: boot-image management](https://docs.redhat.com/en/documentation/openshift_container_platform/4.21/html/machine_configuration/mco-update-boot-images)
 - [OpenShift: `MachineConfiguration` API](https://docs.redhat.com/en/documentation/openshift_container_platform/4.21/html/operator_apis/machineconfiguration-operator-openshift-io-v1)
-- [OSD admission webhook: customer restrictions on `machine.openshift.io`](https://github.com/openshift/managed-cluster-validating-webhooks/blob/master/pkg/webhooks/regularuser/common/regularuser.go)
-- [OSD GCP Windows PAYG reference](https://cloud.redhat.com/experts/osd/gcp-windows-payg-activation/)
+- [Windows PAYG activation reference](https://cloud.redhat.com/experts/osd/gcp-windows-payg-activation/)
