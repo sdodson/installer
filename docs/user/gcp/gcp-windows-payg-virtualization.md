@@ -29,10 +29,10 @@ taint. Use an existing, compatible Windows Server 2025 Datacenter boot source.
   user data, service accounts, and zones. Confirm the C3-metal configuration
   requirements before creating the new MachineSets; no pre-existing C3-metal
   MachineSet or worker is required.
-- A Hyperdisk-backed StorageClass suitable for the Windows guest and a
-  Windows Server 2025 Datacenter VM boot source available as a CDI DataSource
-  in the guest's namespace. Preparing that source is a separate, generic
-  OpenShift Virtualization task.
+- A Windows Server 2025 Datacenter VM boot source available as a CDI
+  DataSource in the guest's namespace. Preparing that source is a separate,
+  generic OpenShift Virtualization task. The Hyperdisk StorageClass is
+  checked and, if necessary, created below.
 - Available C3-metal quota/capacity. PAYG licensing is associated with the
   worker boot disk and has billing implications even when no guest is running.
 
@@ -89,6 +89,77 @@ The new MachineSet keeps the source's
 `machine.openshift.io/cluster-api-cluster` label, zone, and worker role.
 If the cluster uses a different naming convention, choose a unique `NEW_MS`
 manually rather than relying on the substitution above.
+
+## Check guest storage
+
+The worker's Hyperdisk **boot disk** (configured in step 4) and the Windows
+guest's **PVC** are separate. The guest needs a StorageClass backed by the
+GCP Persistent Disk CSI driver with `type: hyperdisk-balanced`. Confirm the
+driver exists:
+
+```bash
+oc get csidriver pd.csi.storage.gke.io
+```
+
+If the driver is missing, resolve that first; a StorageClass cannot install a
+CSI driver. Choose an existing suitable class if available. The following
+looks for one with deferred binding so a new disk can be placed in the VM's
+zone, without restricting it to a single zone or storage pool:
+
+```bash
+HYPERDISK_SC=$(
+  oc get storageclass -o json |
+    jq -r '.items[]
+           | select(.provisioner == "pd.csi.storage.gke.io"
+                    and .parameters.type == "hyperdisk-balanced"
+                    and .volumeBindingMode == "WaitForFirstConsumer"
+                    and .allowVolumeExpansion == true
+                    and .allowedTopologies == null
+                    and (.parameters["storage-pools"] // "") == "")
+           | .metadata.name' |
+    head -n 1
+)
+echo "Suitable existing StorageClass: ${HYPERDISK_SC:-none}"
+```
+
+If none is found, create a **non-default** class. Do not change the cluster's
+default StorageClass, which might serve workers with different disk
+requirements:
+
+```bash
+if [[ -z "$HYPERDISK_SC" ]]; then
+  HYPERDISK_SC=windows-payg-hyperdisk
+  if oc get storageclass "$HYPERDISK_SC" >/dev/null 2>&1; then
+    echo "StorageClass $HYPERDISK_SC already exists but does not match; inspect it or choose another name" >&2
+    exit 1
+  fi
+  cat <<'EOF' | oc create -f -
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: windows-payg-hyperdisk
+provisioner: pd.csi.storage.gke.io
+parameters:
+  type: hyperdisk-balanced
+  replication-type: none
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+EOF
+fi
+export HYPERDISK_SC
+oc get storageclass "$HYPERDISK_SC" -o yaml
+```
+
+Use `$HYPERDISK_SC` explicitly for the Windows VM's root disk in step 6.
+Hyperdisk Balanced volumes must be at least **4 GiB**; the Windows disk must
+also be large enough for its boot source. A matching StorageClass does not
+prove that storage can be provisioned on every selected worker. Check the
+current [GCP PD CSI guidance](https://docs.redhat.com/en/documentation/openshift_container_platform/4.21/html/storage/container_storage_interface/persistent-storage-csi-gcp-pd)
+before proceeding: mixed workers that cannot all use Hyperdisk Balanced may
+not be supported on OCP. Creating a StorageClass does not resolve that
+compatibility constraint. Confirm that the guest's PVC binds and its backing
+disk is `hyperdisk-balanced` after starting a VM.
 
 ## 1. Select the source RHCOS image
 
@@ -353,8 +424,9 @@ worker.
 Use the normal OpenShift Virtualization VM workflow and an existing,
 appropriately prepared Windows Server 2025 Datacenter boot source. The
 DataSource, in this example, must be available **in the VM namespace**; using
-one in another namespace requires the usual CDI clone permissions. Choose the
-Hyperdisk StorageClass for its root disk.
+one in another namespace requires the usual CDI clone permissions. Set its
+root disk's `storageClassName` to `$HYPERDISK_SC`; do not rely on the default
+StorageClass.
 
 Before starting the VM, ensure its `spec.template.spec` has a Node selector
 and toleration for the licensed workers and uses the pod network with
@@ -397,7 +469,12 @@ Verify the VM is running on a labeled, license-verified worker:
 
 ```bash
 oc get vmi -n <windows-vm-namespace> -o wide
+oc get pvc -n <windows-vm-namespace> -o wide
 ```
+
+Confirm the root PVC uses `$HYPERDISK_SC` and becomes `Bound`. Check its
+backing GCE disk's type if storage provisioning fails or the class's
+configuration is uncertain.
 
 ## 7. Activate Windows and verify the result
 
